@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 import io
 import os
+import zipfile
 
 # 1. 모델 로드
 model_path = 'best.pt'
@@ -18,15 +19,18 @@ def get_model():
 
 model = get_model()
 
-st.title("🦷 좌우 균등 자동 크롭기 (3:2)")
-st.write("치아를 중앙에 배치하며, 오류 없이 안정적으로 작동합니다.")
+st.title("🦷 좌우 균등 자동 크롭기 (일괄 저장)")
+st.write("치아 정중선을 기준으로 대칭 크롭 후, 원본 이름 그대로 한꺼번에 저장합니다.")
 
 # 여백 조절 슬라이더
-margin = st.sidebar.slider("여백 크기", 1.2, 3.5, 2.0, step=0.1)
+margin_factor = st.sidebar.slider("여백 크기", 1.0, 3.5, 2.0, step=0.1)
 
 uploaded_files = st.file_uploader("사진을 선택하세요", type=['jpg', 'jpeg', 'png'], accept_multiple_files=True)
 
 if uploaded_files:
+    # 모든 결과물을 담을 리스트 (파일명, 바이너리 데이터)
+    processed_results = []
+    
     for uploaded_file in uploaded_files:
         try:
             file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
@@ -43,48 +47,65 @@ if uploaded_files:
                 if len(boxes) > 0:
                     x1, y1, x2, y2 = boxes[0]
                     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                    bw, bh = x2 - x1, y2 - y1
                     
-                    # [대칭 계산] 중심에서 박스 끝까지의 거리
-                    dx = max(cx - x1, x2 - cx)
-                    dy = max(cy - y1, y2 - cy)
+                    desired_w = (x2 - x1) * margin_factor
+                    desired_h = (y2 - y1) * margin_factor
                     
-                    # 3:2 비율 적용
-                    if (dx * 2) / (dy * 2) > target_ratio:
-                        cw, ch = (dx * 2) * margin, ((dx * 2) * margin) / target_ratio
+                    if desired_w / desired_h > target_ratio:
+                        final_w = desired_w
+                        final_h = final_w / target_ratio
                     else:
-                        ch, cw = (dy * 2) * margin, ((dy * 2) * margin) * target_ratio
+                        final_h = desired_h
+                        final_w = final_h * target_ratio
+                    
+                    # 대칭 한계값 계산
+                    max_half_w = min(cx, w_orig - cx)
+                    max_half_h = min(cy, h_orig - cy)
+                    
+                    half_w = min(final_w / 2, max_half_w)
+                    half_h = half_w / target_ratio
+                    
+                    if half_h > max_half_h:
+                        half_h = max_half_h
+                        half_w = half_h * target_ratio
 
-                    # 초기 좌표
-                    nx1, nx2 = int(cx - cw / 2), int(cx + cw / 2)
-                    ny1, ny2 = int(cy - ch / 2), int(cy + ch / 2)
+                    nx1, nx2 = int(cx - half_w), int(cx + half_w)
+                    ny1, ny2 = int(cy - half_h), int(cy + half_h)
 
-                    # [안전장치] 사진 범위를 벗어나면 '대칭'보다 '표시'를 우선함
-                    if nx1 < 0 or nx2 > w_orig or ny1 < 0 or ny2 > h_orig:
-                        nx1, ny1 = max(0, nx1), max(0, ny1)
-                        nx2, ny2 = min(w_orig, nx2), min(h_orig, ny2)
-                        # 잘린 후 비율이 깨졌을 수 있으므로 다시 한번 3:2 강제 조정
-                        new_w = nx2 - nx1
-                        new_h = int(new_w / target_ratio)
-                        ny2 = min(h_orig, ny1 + new_h)
-
-                    # 실제 자르기
                     cropped = img[ny1:ny2, nx1:nx2]
-                    if cropped.size == 0: 
-                        st.warning(f"{uploaded_file.name}: 크롭 영역 계산 오류")
-                        continue
+                    if cropped.size == 0: continue
                     
                     cropped_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-                    st.image(cropped_rgb, caption=f"완료: {uploaded_file.name}")
                     
-                    # 다운로드 버튼
+                    # 결과물 이미지화 및 버퍼 저장
                     res_img = Image.fromarray(cropped_rgb)
                     buf = io.BytesIO()
                     res_img.save(buf, format="JPEG", quality=95)
-                    st.download_button(label=f"📥 {uploaded_file.name} 받기", 
-                                       data=buf.getvalue(), 
-                                       file_name=f"fixed_{uploaded_file.name}")
+                    
+                    # 리스트에 추가 (압축용)
+                    processed_results.append((uploaded_file.name, buf.getvalue()))
+                    
+                    # 화면에 미리보기 출력
+                    st.image(cropped_rgb, caption=f"처리됨: {uploaded_file.name}")
                 else:
                     st.warning(f"{uploaded_file.name}: 치아를 찾지 못했습니다.")
         except Exception as e:
-            st.error(f"에러 발생 ({uploaded_file.name}): {e}")
+            st.error(f"에러 ({uploaded_file.name}): {e}")
+
+    # --- 일괄 다운로드 버튼 ---
+    if processed_results:
+        st.divider()
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+            for filename, data in processed_results:
+                zip_file.writestr(filename, data)
+        
+        st.download_button(
+            label="📂 모든 사진 원본 이름으로 다운로드 (ZIP)",
+            data=zip_buffer.getvalue(),
+            file_name="processed_dental_images.zip",
+            mime="application/zip",
+            use_container_width=True
+        )
+
+# ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
