@@ -19,11 +19,11 @@ def get_model():
 
 model = get_model()
 
-st.title("🦷 치아 보호 좌우 대칭 크롭기")
-st.write("치아가 잘리지 않는 선에서 최대한의 좌우 대칭을 맞춥니다.")
+st.title("🦷 양 끝 치아 기준 균등 여백 크롭기")
+st.write("가장 바깥쪽 치아에서 사진 끝까지의 거리를 좌우 똑같이 맞춥니다.")
 
-# 여백 조절 슬라이더
-margin_factor = st.sidebar.slider("여백 크기 (치아 대비)", 1.0, 3.5, 1.8, step=0.1)
+# 여백 조절 슬라이더 (치아 바깥쪽 추가 공간)
+extra_margin = st.sidebar.slider("추가 여백 (픽셀)", 10, 500, 100, step=10)
 
 uploaded_files = st.file_uploader("사진을 선택하세요", type=['jpg', 'jpeg', 'png'], accept_multiple_files=True)
 
@@ -45,57 +45,55 @@ if uploaded_files:
             for r in results:
                 boxes = r.boxes.xyxy.cpu().numpy()
                 if len(boxes) > 0:
-                    x1, y1, x2, y2 = boxes[0]
-                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                    bw, bh = x2 - x1, y2 - y1
-
-                    # [해결책 1] 치아 본체는 무조건 포함하는 최소 반폭 설정
-                    min_half_w = bw / 2
-                    min_half_h = bh / 2
-
-                    # [해결책 2] 사용자가 원하는 여백 적용
-                    desired_half_w = (bw * margin_factor) / 2
-                    desired_half_h = desired_half_w / target_ratio
-
-                    # [해결책 3] 사진 경계를 넘지 않는 최대 허용 대칭폭 계산
-                    # 중심에서 좌우 끝까지의 거리 중 짧은 쪽을 기준으로 함
-                    limit_half_w = min(cx, w_orig - cx)
-                    limit_half_h = min(cy, h_orig - cy)
-
-                    # 최종 반폭 결정: (원하는 폭 vs 한계 폭) 중 작은 값 선택 
-                    # 단, 치아(min_half_w)보다는 커야 함
-                    final_half_w = max(min_half_w, min(desired_half_w, limit_half_w))
-                    final_half_h = final_half_w / target_ratio
-
-                    # 높이 제약 조건 확인
-                    if final_half_h > limit_half_h:
-                        final_half_h = limit_half_h
-                        final_half_w = final_half_h * target_ratio
+                    # 모든 탐지된 치아를 포함하는 전체 바운딩 박스 계산
+                    # (여러 치아가 각각 탐지될 경우를 대비해 전체 영역을 잡음)
+                    all_x1 = np.min(boxes[:, 0])
+                    all_y1 = np.min(boxes[:, 1])
+                    all_x2 = np.max(boxes[:, 2])
+                    all_y2 = np.max(boxes[:, 3])
                     
-                    # 다시 한번 치아 폭 보호 (최종 확인)
-                    if final_half_w < min_half_w:
-                        final_half_w = min_half_w
-                        final_half_h = final_half_w / target_ratio
-
-                    # 좌표 확정 (이미지 범위를 절대 벗어나지 않도록 clip)
-                    nx1 = int(np.clip(cx - final_half_w, 0, w_orig))
-                    nx2 = int(np.clip(cx + final_half_w, 0, w_orig))
-                    ny1 = int(np.clip(cy - final_half_h, 0, h_orig))
-                    ny2 = int(np.clip(cy + final_half_h, 0, h_orig))
-
-                    cropped = img[ny1:ny2, nx1:nx2]
-                    if cropped.size == 0: continue
+                    tooth_width = all_x2 - all_x1
+                    tooth_height = all_y2 - all_y1
                     
-                    # 3:2 비율 강제 리사이즈 (자르기 후 미세 오차 조정)
-                    cropped_resized = cv2.resize(cropped, (int((ny2-ny1)*target_ratio), ny2-ny1))
+                    # [핵심 로직] 양 끝 치아 기준 여백 설정
+                    # 1. 치아를 포함하고 좌우에 extra_margin만큼의 공간을 확보한 폭
+                    desired_w = tooth_width + (extra_margin * 2)
+                    # 2. 3:2 비율을 위한 높이 계산
+                    desired_h = desired_w / target_ratio
                     
-                    cropped_rgb = cv2.cvtColor(cropped_resized, cv2.COLOR_BGR2RGB)
+                    # 만약 계산된 높이가 실제 치아 높이보다 작으면 높이 기준으로 재계산
+                    if desired_h < tooth_height + (extra_margin * 2 / target_ratio):
+                        desired_h = tooth_height + (extra_margin * 2 / target_ratio)
+                        desired_w = desired_h * target_ratio
+
+                    # 3. 중심점 설정 (치아 뭉치의 정중앙)
+                    cx, cy = (all_x1 + all_x2) / 2, (all_y1 + all_y2) / 2
+                    
+                    # 4. 좌표 계산 및 패딩 처리
+                    nx1, nx2 = int(cx - desired_w / 2), int(cx + desired_w / 2)
+                    ny1, ny2 = int(cy - desired_h / 2), int(cy + desired_h / 2)
+
+                    # 사진 범위를 벗어나면 패딩 생성 (검은색)
+                    pad_l = max(0, -nx1)
+                    pad_r = max(0, nx2 - w_orig)
+                    pad_t = max(0, -ny1)
+                    pad_b = max(0, ny2 - h_orig)
+
+                    padded_img = cv2.copyMakeBorder(img, pad_t, pad_b, pad_l, pad_r, 
+                                                   cv2.BORDER_CONSTANT, value=[0, 0, 0])
+
+                    # 패딩된 이미지에서 크롭
+                    final_cropped = padded_img[ny1+pad_t : ny2+pad_t, nx1+pad_l : nx2+pad_l]
+                    
+                    if final_cropped.size == 0: continue
+                    
+                    cropped_rgb = cv2.cvtColor(final_cropped, cv2.COLOR_BGR2RGB)
                     res_img = Image.fromarray(cropped_rgb)
                     buf = io.BytesIO()
                     res_img.save(buf, format="JPEG", quality=95)
                     
                     processed_results.append((uploaded_file.name, buf.getvalue()))
-                    st.image(cropped_rgb, caption=f"치아 보호 대칭 완료: {uploaded_file.name}")
+                    st.image(cropped_rgb, caption=f"양 끝 여백 정렬 완료: {uploaded_file.name}")
                 else:
                     st.warning(f"{uploaded_file.name}: 치아를 찾지 못했습니다.")
         except Exception as e:
@@ -116,6 +114,4 @@ if uploaded_files:
             use_container_width=True
         )
 
-# --------------------------------------------------------------------------------------------------
-# 공간이 남아서 채우는 기호: --------------------------------------------------------------------------
-# --------------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
