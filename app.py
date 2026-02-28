@@ -19,11 +19,8 @@ def get_model():
 
 model = get_model()
 
-st.title("🦷 픽셀 정밀 대칭 크롭기")
-st.write("AI 감지 후 픽셀 분석을 통해 좌우 여백을 1px 단위로 맞춥니다.")
-
-# 여백 조절 슬라이더
-margin_px = st.sidebar.slider("치아 끝단 기준 추가 여백 (px)", 20, 600, 150, step=10)
+st.title("🦷 좌우 여백 실측 동일화기")
+st.write("치아 끝단에서 사진 경계까지의 거리를 측정하여 양쪽을 똑같이 맞춥니다.")
 
 uploaded_files = st.file_uploader("사진을 선택하세요", type=['jpg', 'jpeg', 'png'], accept_multiple_files=True)
 
@@ -40,61 +37,49 @@ if uploaded_files:
             h_orig, w_orig = img.shape[:2]
             target_ratio = 1.5 # 3:2
 
-            # YOLO 예측
             results = model.predict(img, conf=0.35, verbose=False)
             
             for r in results:
                 boxes = r.boxes.xyxy.cpu().numpy()
                 if len(boxes) > 0:
-                    # 1. YOLO 박스 영역 추출
-                    yolo_x1, yolo_y1, yolo_x2, yolo_y2 = np.min(boxes[:, 0]), np.min(boxes[:, 1]), np.max(boxes[:, 2]), np.max(boxes[:, 3])
+                    # 1. 모든 치아를 포함하는 영역 탐지
+                    tx1, ty1, tx2, ty2 = np.min(boxes[:, 0]), np.min(boxes[:, 1]), np.max(boxes[:, 2]), np.max(boxes[:, 3])
                     
-                    # 2. [정밀 분석] 박스 내부에서 실제 '밝은 치아' 영역 재탐색
-                    roi = img[int(yolo_y1):int(yolo_y2), int(yolo_x1):int(yolo_x2)]
-                    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                    _, binary_roi = cv2.threshold(gray_roi, 120, 255, cv2.THRESH_BINARY) # 밝은 부분만 남김
+                    # 2. [실측] 왼쪽 여백(L)과 오른쪽 여백(R) 측정
+                    left_margin = tx1
+                    right_margin = w_orig - tx2
                     
-                    coords = cv2.findNonZero(binary_roi)
-                    if coords is not None:
-                        rx, ry, rw, rh = cv2.boundingRect(coords)
-                        # 원본 이미지 기준 실제 치아 끝단 좌표
-                        real_x1 = yolo_x1 + rx
-                        real_x2 = yolo_x1 + rx + rw
-                        real_y1 = yolo_y1 + ry
-                        real_y2 = yolo_y1 + ry + rh
-                    else:
-                        real_x1, real_x2, real_y1, real_y2 = yolo_x1, yolo_x2, yolo_y1, yolo_y2
+                    # 3. [동일화] 더 좁은 쪽의 여백을 기준으로 설정
+                    min_margin = min(left_margin, right_margin)
+                    
+                    # 4. 새로운 크롭 범위 설정 (여백을 동일하게 적용)
+                    nx1 = tx1 - min_margin
+                    nx2 = tx2 + min_margin
+                    
+                    # 5. 3:2 비율을 맞추기 위한 높이 계산 (중심축 유지)
+                    new_width = nx2 - nx1
+                    new_height = new_width / target_ratio
+                    
+                    cy = (ty1 + ty2) / 2
+                    ny1 = int(max(0, cy - new_height / 2))
+                    ny2 = int(min(h_orig, cy + new_height / 2))
+                    
+                    # 가로 좌표 정수화
+                    nx1, nx2 = int(nx1), int(nx2)
 
-                    # 3. 실제 치아 끝단을 기준으로 한 중심축(Midline)
-                    midline_x = (real_x1 + real_x2) / 2
-                    midline_y = (real_y1 + real_y2) / 2
-                    
-                    # 4. 좌우 여백을 똑같이 맞춘 최종 폭 계산
-                    # (치아 실제 폭 + 양쪽 동일 여백)
-                    final_w = (real_x2 - real_x1) + (margin_px * 2)
-                    final_h = final_w / target_ratio
-                    
-                    # 5. 좌표 설정 및 패딩(이미지 부족 시 보완)
-                    nx1, nx2 = int(midline_x - final_w/2), int(midline_x + final_w/2)
-                    ny1, ny2 = int(midline_y - final_h/2), int(midline_y + final_h/2)
-                    
-                    pad_l, pad_r = max(0, -nx1), max(0, nx2 - w_orig)
-                    pad_t, pad_b = max(0, -ny1), max(0, ny2 - h_orig)
-                    
-                    padded_img = cv2.copyMakeBorder(img, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_CONSTANT, value=[0, 0, 0])
-                    
-                    # 6. 최종 크롭
-                    final_cropped = padded_img[ny1+pad_t : ny2+pad_t, nx1+pad_l : nx2+pad_l]
+                    # 6. 최종 자르기
+                    final_cropped = img[ny1:ny2, nx1:nx2]
                     
                     if final_cropped.size == 0: continue
                     
+                    # 결과물 변환 및 저장
                     cropped_rgb = cv2.cvtColor(final_cropped, cv2.COLOR_BGR2RGB)
                     res_img = Image.fromarray(cropped_rgb)
                     buf = io.BytesIO()
                     res_img.save(buf, format="JPEG", quality=95)
                     
                     processed_results.append((uploaded_file.name, buf.getvalue()))
-                    st.image(cropped_rgb, caption=f"정밀 정렬 완료: {uploaded_file.name}")
+                    st.image(cropped_rgb, caption=f"여백 실측 동기화 완료: {uploaded_file.name} (여백: {int(min_margin)}px)")
                 else:
                     st.warning(f"{uploaded_file.name}: 치아를 찾지 못했습니다.")
         except Exception as e:
@@ -115,4 +100,6 @@ if uploaded_files:
             use_container_width=True
         )
 
-# ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
+# 공간이 남아서 채우는 기호: --------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
